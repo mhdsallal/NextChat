@@ -4,110 +4,81 @@ import { getServerSideConfig } from "@/app/config/server";
 import { ApiPath, GEMINI_BASE_URL, ModelProvider } from "@/app/constant";
 import { prettyObject } from "@/app/utils/format";
 
+// Module-level singleton — avoids re-running on every request
 const serverConfig = getServerSideConfig();
+
+// Normalize base URL once, not on every request
+const BASE_URL = (() => {
+  let url = serverConfig.googleUrl || GEMINI_BASE_URL;
+  if (!url.startsWith("http")) url = `https://${url}`;
+  if (url.endsWith("/")) url = url.slice(0, -1);
+  return url;
+})();
+
+const TIMEOUT_MS = 10 * 60 * 1000;
+
+function extractApiKey(req: NextRequest): string {
+  const raw = req.headers.get("x-goog-api-key")
+    ?? req.headers.get("Authorization")
+    ?? "";
+  return raw.trim().replace(/^Bearer\s+/i, "").trim();
+}
 
 export async function handle(
   req: NextRequest,
   { params }: { params: { provider: string; path: string[] } },
 ) {
-  console.log("[Google Route] params ", params);
-
   if (req.method === "OPTIONS") {
-    return NextResponse.json({ body: "OK" }, { status: 200 });
+    return new NextResponse(null, { status: 204 }); // 204 is correct for OPTIONS
   }
 
   const authResult = auth(req, ModelProvider.GeminiPro);
   if (authResult.error) {
-    return NextResponse.json(authResult, {
-      status: 401,
-    });
+    return NextResponse.json(authResult, { status: 401 });
   }
 
-  const bearToken =
-    req.headers.get("x-goog-api-key") || req.headers.get("Authorization") || "";
-  const token = bearToken.trim().replaceAll("Bearer ", "").trim();
-
-  const apiKey = token ? token : serverConfig.googleApiKey;
+  const token = extractApiKey(req);
+  const apiKey = token || serverConfig.googleApiKey;
 
   if (!apiKey) {
     return NextResponse.json(
-      {
-        error: true,
-        message: `missing GOOGLE_API_KEY in server env vars`,
-      },
-      {
-        status: 401,
-      },
+      { error: true, message: "missing GOOGLE_API_KEY in server env vars" },
+      { status: 401 },
     );
   }
+
   try {
-    const response = await request(req, apiKey);
-    return response;
+    return await proxyRequest(req, apiKey);
   } catch (e) {
-    console.error("[Google] ", e);
-    return NextResponse.json(prettyObject(e));
+    console.error("[Google]", e);
+    return NextResponse.json(prettyObject(e), { status: 502 });
   }
 }
 
 export const GET = handle;
 export const POST = handle;
-
 export const runtime = "edge";
 export const preferredRegion = [
-  "bom1",
-  "cle1",
-  "cpt1",
-  "gru1",
-  "hnd1",
-  "iad1",
-  "icn1",
-  "kix1",
-  "pdx1",
-  "sfo1",
-  "sin1",
-  "syd1",
+  "bom1", "cle1", "cpt1", "gru1", "hnd1",
+  "iad1", "icn1", "kix1", "pdx1", "sfo1", "sin1", "syd1",
 ];
 
-async function request(req: NextRequest, apiKey: string) {
+async function proxyRequest(req: NextRequest, apiKey: string): Promise<Response> {
   const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), TIMEOUT_MS);
 
-  let baseUrl = serverConfig.googleUrl || GEMINI_BASE_URL;
+  const path = req.nextUrl.pathname.replace(ApiPath.Google, "");
+  const isSSE = req.nextUrl.searchParams.get("alt") === "sse";
+  const fetchUrl = `${BASE_URL}${path}${isSSE ? "?alt=sse" : ""}`;
 
-  let path = `${req.nextUrl.pathname}`.replaceAll(ApiPath.Google, "");
-
-  if (!baseUrl.startsWith("http")) {
-    baseUrl = `https://${baseUrl}`;
-  }
-
-  if (baseUrl.endsWith("/")) {
-    baseUrl = baseUrl.slice(0, -1);
-  }
-
-  console.log("[Proxy] ", path);
-  console.log("[Base Url]", baseUrl);
-
-  const timeoutId = setTimeout(
-    () => {
-      controller.abort();
-    },
-    10 * 60 * 1000,
-  );
-  const fetchUrl = `${baseUrl}${path}${
-    req?.nextUrl?.searchParams?.get("alt") === "sse" ? "?alt=sse" : ""
-  }`;
-
-  console.log("[Fetch Url] ", fetchUrl);
   const fetchOptions: RequestInit = {
+    method: req.method,
+    body: req.body,
     headers: {
       "Content-Type": "application/json",
       "Cache-Control": "no-store",
-      "x-goog-api-key":
-        req.headers.get("x-goog-api-key") ||
-        (req.headers.get("Authorization") ?? "").replace("Bearer ", ""),
+      "x-goog-api-key": apiKey, // already resolved — no need to re-read headers
     },
-    method: req.method,
-    body: req.body,
-    // to fix #2485: https://stackoverflow.com/questions/55920957/cloudflare-worker-typeerror-one-time-use-body
     redirect: "manual",
     // @ts-ignore
     duplex: "half",
@@ -116,10 +87,8 @@ async function request(req: NextRequest, apiKey: string) {
 
   try {
     const res = await fetch(fetchUrl, fetchOptions);
-    // to prevent browser prompt for credentials
     const newHeaders = new Headers(res.headers);
     newHeaders.delete("www-authenticate");
-    // to disable nginx buffering
     newHeaders.set("X-Accel-Buffering", "no");
 
     return new Response(res.body, {
