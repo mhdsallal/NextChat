@@ -79,7 +79,6 @@ async function request(req: NextRequest) {
     signal: controller.signal,
   };
 
-  // #1815 try to refuse some request to some models
   if (serverConfig.customModels && req.body) {
     try {
       const clonedBody = await req.text();
